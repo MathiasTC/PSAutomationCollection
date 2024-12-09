@@ -14,11 +14,12 @@ function Get-AzToken {
     }
     return $Token    
 }
-$token = Get-AzToken -ResourceUri 'https://graph.microsoft.com/'
+
+$token = Get-AzToken -ResourceUri 'https://graph.microsoft.com/' -AsHeader
 
 #### Step 2: Mapping all the parameters and calling Cloud PC endpoint
 # Set headers
-$headers = @{"Authorization" = "Bearer " + $token}
+$headers = $token.Headers
 # BaseURI for graph calls
 $baseUri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint"
 # Format date 60 days ago
@@ -40,19 +41,33 @@ $params = @"
 "@
 
 # Retrieve all devices and make a variable with all grace period devices
-$allCloudPCs = Invoke-RestMethod -Uri "$baseUri/cloudPCs" -Headers $headers -Method GET
-$allGracePeriodDevices = $allCloudPCs.value | where-object {$_.status -eq "inGracePeriod"}
+try {
+    $allCloudPCs = Invoke-RestMethod -Uri "$baseUri/cloudPCs" -Headers $headers -Method GET -ErrorAction Stop
+    $allGracePeriodDevices = $allCloudPCs.value | where-object {$_.status -eq "inGracePeriod"}
+} catch {
+    Write-Error "Failed to retrieve Cloud PCs: $_"
+    exit
+}
 
 # Retrieve utilization Cloud PCs list
-$cloudPCs = Invoke-RestMethod -Uri "$baseUri/reports/getTotalAggregatedRemoteConnectionReports" -Headers $headers -Method POST -ContentType "application/json" -Body $params
+try {
+    $cloudPCs = Invoke-RestMethod -Uri "$baseUri/reports/getTotalAggregatedRemoteConnectionReports" -Headers $headers -Method POST -ContentType "application/json" -Body $params -ErrorAction Stop
+} catch {
+    Write-Error "Failed to retrieve Cloud PC utilization reports: $_"
+    exit
+}
 
 #### Step 3: Creating the generic functions
 # Function to send email via Microsoft Graph API
 function Send-GraphEmail {
     param (
+        [Parameter(Mandatory = $true)]
         [string]$from,
+        [Parameter(Mandatory = $true)]
         [string]$to,
+        [Parameter(Mandatory = $true)]
         [string]$subject,
+        [Parameter(Mandatory = $true)]
         [string]$body
     )
 
@@ -75,13 +90,19 @@ function Send-GraphEmail {
 
     $emailMessageJson = $emailMessage | ConvertTo-Json -Depth 10
     $sendMailUri = "https://graph.microsoft.com/v1.0/me/sendMail"
-    Invoke-RestMethod -Uri $sendMailUri -Headers $headers -Method POST -ContentType "application/json" -Body $emailMessageJson
+    try {
+        Invoke-RestMethod -Uri $sendMailUri -Headers $headers -Method POST -ContentType "application/json" -Body $emailMessageJson -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to send email: $_"
+    }
 }
 
 # Function to add a specific license to a user
 function Add-UserLicense {
     param (
+        [Parameter(Mandatory = $true)]
         [string]$userId,
+        [Parameter(Mandatory = $true)]
         [string]$skuId
     )
 
@@ -92,13 +113,19 @@ function Add-UserLicense {
 
     $addLicenseJson = $addLicenseBody | ConvertTo-Json
     $addLicenseUri = "https://graph.microsoft.com/v1.0/users/$userId/assignLicense"
-    Invoke-RestMethod -Uri $addLicenseUri -Headers $headers -Method POST -ContentType "application/json" -Body $addLicenseJson
+    try {
+        Invoke-RestMethod -Uri $addLicenseUri -Headers $headers -Method POST -ContentType "application/json" -Body $addLicenseJson -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to add license: $_"
+    }
 }
 
 # Function to remove a specific license from a user
 function Remove-UserLicense {
     param (
+        [Parameter(Mandatory = $true)]
         [string]$userId,
+        [Parameter(Mandatory = $true)]
         [string]$skuId
     )
 
@@ -109,19 +136,28 @@ function Remove-UserLicense {
 
     $removeLicenseJson = $removeLicenseBody | ConvertTo-Json
     $removeLicenseUri = "https://graph.microsoft.com/v1.0/users/$userId/assignLicense"
-    Invoke-RestMethod -Uri $removeLicenseUri -Headers $headers -Method POST -ContentType "application/json" -Body $removeLicenseJson
+    try {
+        Invoke-RestMethod -Uri $removeLicenseUri -Headers $headers -Method POST -ContentType "application/json" -Body $removeLicenseJson -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to remove license: $_"
+    }
 }
 
 # Function to fetch SKU ID dynamically based on Cloud PC type
 function Get-SkuId {
     param (
+        [Parameter(Mandatory = $true)]
         [PSCustomObject]$customObj
     )
 
     # Fetch SKU details
-    $licenseDetails = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/subscribedSkus" -Headers $headers -Method GET
-    $cpcLicenses = $licenseDetails.value | Where-object {$_.skuPartNumber -like "CPC_*"}
-    
+    try {
+        $licenseDetails = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/subscribedSkus" -Headers $headers -Method GET -ErrorAction Stop
+    } catch {
+        Write-Error "Failed to retrieve SKU details: $_"
+        return $null
+    }
+
     # Split SKU name from customObj object
     $splitObj = $customObj.PcType.Split(" ")
     $splitObj = $splitObj[3].Split("/")
@@ -158,8 +194,10 @@ foreach ($device in $allGracePeriodDevices) {
     $isPresent = $cloudPCs.values | Where-Object {$_ -like "*$($device.id)*"}
     if ($isPresent) {
         $skuId = Get-SkuId -customObj $customObj
-        $userId = $customObj.UserPrincipalName
-        Add-UserLicense -userId $userId -skuId $skuId
+        if ($skuId) {
+            $userId = $customObj.UserPrincipalName
+            Add-UserLicense -userId $userId -skuId $skuId
+        }
     } else {
         Write-Host "Cloud PC: $($device.id) is not in use.."
     }
@@ -191,8 +229,9 @@ foreach ($cpc in $cloudPCs.values) {
         # Remove license from user (Direct assigned license)    
         $userId = $customObj.UserPrincipalName
         $skuId = Get-SkuId -customObj $customObj
-        
-        Remove-UserLicense -userId $userId -skuId $skuId
-        Write-Host "License has been successfully removed from user"
+        if ($skuId) {
+            Remove-UserLicense -userId $userId -skuId $skuId
+            Write-Host "License has been successfully removed from user"
+        }
     }
 }
